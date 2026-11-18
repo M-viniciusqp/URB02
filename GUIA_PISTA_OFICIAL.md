@@ -27,6 +27,10 @@ Comparar as duas na pista: rode a mesma volta nas duas e veja qual perde menos a
 - Apareceu `AUTO FALHOU (poucas amostras) -> valor seguro` → não viu linha suficiente nos
   primeiros segundos (carro fora da faixa/luz ruim). Ele usa 0.6, que é tolerante e serve.
 - Não apareceu nada → você fixou um número no config (modo manual).
+- **A medida só vale com o carro NA pista**: a amostra só conta quando a visão achou a faixa
+  naquele frame. Se o carro estiver fora da pista, ele espera (até ~10 s) e, se nunca vir a
+  faixa, usa 0.6. Se depois de calibrar ele ficar ~2,5 s sem ver a faixa, **mede de novo**
+  (até 2 vezes por execução) — você vê `medindo a linha de novo` no log.
 
 ## Teste rápido da visão (sem motor)
 Com o carro NA faixa:

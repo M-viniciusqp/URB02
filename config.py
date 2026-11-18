@@ -81,6 +81,8 @@ LINHA_REF_PX     = 20.0   # largura (px, a 30% da altura da area de varredura, i
 LINHA_CAL_FRAMES = 60     # amostras validas pra fechar a medida (~2 s)
 LINHA_CAL_TIMEOUT = 300   # frames sem medida suficiente -> usa LINHA_ESP_FALLBACK
 LINHA_ESP_FALLBACK = 0.6  # valor seguro (tolerante) se nao conseguir medir
+LINHA_RECAL_PERDIDOS = 75  # frames SEGUIDOS sem faixa valida (depois de calibrar) -> mede de novo
+LINHA_RECAL_MAX      = 2   # no maximo isso de re-calibracoes por execucao
 
 
 def aplicar_espessura(esp):

@@ -59,6 +59,9 @@ class LaneVision:
         # fina a grossa. Zebra (muitas barras) e frames sem linha nao contam.
         self._cal_larguras = []
         self._cal_frames = 0
+        self._cal_pend = None
+        self._cal_perdidos = 0
+        self._cal_recal = 0
         self.linha_largura_px = None     # largura medida (None ate terminar)
         self.linha_espessura = None      # espessura calculada (None ate terminar)
         self._k_close = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
@@ -114,45 +117,41 @@ class LaneVision:
         k = larg * 2 + 1
         self._k_line = cv2.getStructuringElement(cv2.MORPH_RECT, (k, k))
 
-    def _calibra_espessura(self, mask):
-        """Acumula a largura da linha perto do carro; ao juntar amostras
-        suficientes (ou estourar o tempo), ajusta a visao."""
-        self._cal_frames += 1
+    def _mede_larguras(self, mask):
+        """Largura mediana (px) dos trechos brancos a ~30% da altura da area de
+        varredura (contando de cima): ali as duas linhas ja estao DENTRO do
+        quadro e ainda tem largura util. Perto do carro (baixo) a linha sai
+        pelos lados da imagem e a medida encolhe; no fundo vira 1-2 px e some
+        no ruido. None = frame sem amostra (nada visivel, ou barras demais =
+        zebra). So vira amostra DE VERDADE se a visao tambem achou a faixa
+        nesse frame (ver process())."""
         h = mask.shape[0]
         larguras = []
         n_runs = 0
-        # Mede em ~30% da altura da area de varredura (contando de cima): ali as
-        # duas linhas ja estao DENTRO do quadro e ainda tem largura util. Perto
-        # do carro (baixo) a linha sai pelos lados da imagem e a medida
-        # encolhe; no fundo ela vira 1-2 px e some no ruido.
         for f in (0.26, 0.30, 0.34):
             row = mask[int(f * (h - 1))]
             idx = np.flatnonzero(row)
             if idx.size == 0:
                 continue
-            grupos = np.split(idx, np.flatnonzero(np.diff(idx) > 1) + 1)
-            for g in grupos:
-                w = len(g)
+            for g in np.split(idx, np.flatnonzero(np.diff(idx) > 1) + 1):
                 n_runs += 1
-                if 3 <= w <= 90:
-                    larguras.append(w)
-        # zebra (barras demais) ou nada na imagem: nao serve como amostra
+                if 3 <= len(g) <= 90:
+                    larguras.append(len(g))
         if larguras and n_runs <= 14:
-            self._cal_larguras.append(float(np.median(larguras)))
+            return float(np.median(larguras))
+        return None
 
-        pronto = len(self._cal_larguras) >= config.LINHA_CAL_FRAMES
-        estourou = self._cal_frames >= config.LINHA_CAL_TIMEOUT
-        if not (pronto or estourou):
-            return
+    def _cal_fecha(self):
+        """Fecha a calibracao: traduz a largura medida em espessura."""
         self._cal_ativa = False       # (_monta_kernels abaixo volta ao kernel normal)
         if len(self._cal_larguras) >= max(10, config.LINHA_CAL_FRAMES // 3):
             self.linha_largura_px = float(np.median(self._cal_larguras))
-            esp = self.linha_largura_px / float(config.LINHA_REF_PX)
-            esp = config.aplicar_espessura(esp)
+            esp = config.aplicar_espessura(self.linha_largura_px / float(config.LINHA_REF_PX))
             origem = "auto"
         else:
+            self.linha_largura_px = None
             esp = config.aplicar_espessura(config.LINHA_ESP_FALLBACK)
-            origem = "AUTO FALHOU (poucas amostras) -> valor seguro"
+            origem = "AUTO FALHOU (poucas amostras com faixa valida) -> valor seguro"
         self.linha_espessura = esp
         self._monta_kernels()
         medida = (f"{self.linha_largura_px:.0f} px (a 30% da altura da imagem de varredura)"
@@ -161,6 +160,19 @@ class LaneVision:
               f"trecho>={config.SCAN_MIN_RUN_PX}px linhas>={config.SCAN_MIN_ROWS} "
               f"blur {config.VISAO_BLUR_K} abertura {config.VISAO_OPEN_K} | luz "
               f"{'adaptativa' if config.LUZ_ADAPTATIVA else 'antiga'}")
+
+    def _reinicia_calibracao(self):
+        """Perdeu a faixa por muito tempo depois de calibrar: a medida pode ter
+        sido feita com o carro fora da pista. Volta ao modo tolerante e mede de novo."""
+        self._cal_recal += 1
+        self._cal_perdidos = 0
+        self._cal_ativa = True
+        self._cal_larguras = []
+        self._cal_frames = 0
+        config.aplicar_espessura(0.5)
+        self._monta_kernels()
+        print(f"  [visao] faixa perdida por muito tempo -> medindo a linha de novo "
+              f"({self._cal_recal}/{config.LINHA_RECAL_MAX})")
 
     # ------------------------------------------------------------------
     def threshold(self, roi):
@@ -258,6 +270,25 @@ class LaneVision:
 
     # ------------------------------------------------------------------
     def process(self, frame, debug=False):
+        res = self._process_interno(frame, debug)
+        bom = bool(res.valid and res.motivo == "ok")
+        if self._cal_ativa:
+            # so conta a amostra se a visao achou a faixa NESTE frame: evita
+            # calibrar com a camera apontada pra fora da pista
+            self._cal_frames += 1
+            if bom and self._cal_pend is not None:
+                self._cal_larguras.append(self._cal_pend)
+            if (len(self._cal_larguras) >= config.LINHA_CAL_FRAMES
+                    or self._cal_frames >= config.LINHA_CAL_TIMEOUT):
+                self._cal_fecha()
+        elif getattr(config, "LINHA_AUTO", False):
+            self._cal_perdidos = 0 if bom else self._cal_perdidos + 1
+            if (self._cal_perdidos >= config.LINHA_RECAL_PERDIDOS
+                    and self._cal_recal < config.LINHA_RECAL_MAX):
+                self._reinicia_calibracao()
+        return res
+
+    def _process_interno(self, frame, debug=False):
         res = LaneResult()
 
         y0 = int(self.H * config.SCAN_TOP_PCT)      # corta ceu/fundo
@@ -267,8 +298,7 @@ class LaneVision:
         # reaproveitar em vez de recalcular o top-hat -- economiza ~5ms/frame.
         # Nao altera nada do comportamento da visao.
         self.last_mask = mask          # BRUTA: e o que a zebra usa
-        if self._cal_ativa:
-            self._calibra_espessura(mask)
+        self._cal_pend = self._mede_larguras(mask) if self._cal_ativa else None
         if getattr(config, "LUZ_BLOB", False):
             mask = self._sem_reflexo(mask)
         roi_h = mask.shape[0]
